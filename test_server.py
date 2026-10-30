@@ -6,6 +6,7 @@ class CoreTests(unittest.TestCase):
   self.assertEqual(server.category("Analyze CSV data"),"Analysis")
  def test_plan(self):
   self.assertEqual([x["role"] for x in server.plan("Write a report")],["Planner","Researcher","Reviewer"])
+  self.assertEqual([x["role"] for x in server.plan("Build a website")],["Planner","Developer","Reviewer"])
  def test_token_estimate(self):
   self.assertEqual(server.estimate_tokens("12345678"),2)
   self.assertEqual(server.estimate_tokens(""),0)
