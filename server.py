@@ -92,7 +92,7 @@ def run(t):
   except Exception as e:log(t,'handoff',str(e)+'; trying next free provider.')
  with db() as c:c.execute("UPDATE tasks SET status='failed',error='Eligible providers failed.' WHERE id=?",(t,))
 
-def plan(s):return [{'role':'Planner','task':'Scope '+category(s)+' work'},{'role':'Developer/Researcher','task':'Complete assignment'},{'role':'Reviewer','task':'Check output'}]
+def plan(s):return [{'role':'Planner','task':'Scope '+category(s)+' work'},{'role':'Developer' if category(s)=='Development' else 'Researcher','task':'Complete assignment'},{'role':'Reviewer','task':'Check output'}]
 class H(BaseHTTPRequestHandler):
  def log_message(self,*x):pass
  def send(self,n,o):
