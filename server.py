@@ -26,15 +26,19 @@ def init():
  with db() as c:
   c.executescript("""PRAGMA journal_mode=WAL;
   CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,model TEXT,base TEXT,key TEXT,enabled INT DEFAULT 0,paid INT DEFAULT 0,priority INT DEFAULT 10,context_window INT DEFAULT 8192);
-  CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,prompt TEXT,status TEXT,plan TEXT,output TEXT DEFAULT '',provider TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP,error TEXT DEFAULT '',attempts INT DEFAULT 0,paused INT DEFAULT 0);
+  CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,prompt TEXT,status TEXT,plan TEXT,output TEXT DEFAULT '',provider TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP,error TEXT DEFAULT '',attempts INT DEFAULT 0,paused INT DEFAULT 0,chat_id TEXT);
   CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,task TEXT,kind TEXT,message TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
   CREATE TABLE IF NOT EXISTS token_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,provider TEXT,model TEXT,input_tokens INT,output_tokens INT,context_tokens INT,source TEXT,task TEXT,context_window INT,created TEXT DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS chats(id TEXT PRIMARY KEY,title TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP,updated TEXT DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id TEXT NOT NULL,task_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
   INSERT OR IGNORE INTO settings VALUES('stop','false');
   UPDATE settings SET value='false' WHERE key='stop';
   UPDATE tasks SET status='failed',error='Interrupted by server restart; retry this task to resume.' WHERE status='running';""")
-  cols={r[1] for r in c.execute("PRAGMA table_info(providers)")}
-  if 'context_window' not in cols:c.execute("ALTER TABLE providers ADD COLUMN context_window INT DEFAULT 8192")
+  task_cols={r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+  if 'chat_id' not in task_cols:c.execute("ALTER TABLE tasks ADD COLUMN chat_id TEXT")
+  provider_cols={r[1] for r in c.execute("PRAGMA table_info(providers)")}
+  if 'context_window' not in provider_cols:c.execute("ALTER TABLE providers ADD COLUMN context_window INT DEFAULT 8192")
   for k,(n,b,m,p) in P.items():c.execute('INSERT OR IGNORE INTO providers(id,model,base,paid) VALUES(?,?,?,?)',(k,m,b,int(p)))
 
 def log(t,k,m):
@@ -72,22 +76,31 @@ def call(p,s):
   return answer,ip,op,source
  except urllib.error.HTTPError as e:raise RuntimeError(('429 ' if e.code==429 else 'server error ' if e.code>=500 else '')+'HTTP '+str(e.code))
 
+def chat_prompt(messages):
+ return "\n\n".join(("User" if m['role']=='user' else "Assistant")+": "+m['content'] for m in messages)
 def run(t):
  with db() as c:q=c.execute('SELECT * FROM tasks WHERE id=?',(t,)).fetchone();ps=c.execute('SELECT * FROM providers WHERE enabled=1 AND paid=0 ORDER BY priority').fetchall()
  if not q:return
  if not ps:
   with db() as c:c.execute("UPDATE tasks SET status='waiting',error='Connect a free provider.' WHERE id=?",(t,))
   log(t,'notice','Task saved. Connect a free model to run it.');return
+ prompt=q['prompt']
+ if q['chat_id']:
+  with db() as c:history=c.execute("SELECT role,content FROM chat_messages WHERE chat_id=? ORDER BY id",(q['chat_id'],)).fetchall()
+  prompt=chat_prompt(history)
  for i,p in enumerate(ps[:3],1):
   with db() as c:
    if c.execute("SELECT value FROM settings WHERE key='stop'").fetchone()[0]=='true' or c.execute('SELECT paused FROM tasks WHERE id=?',(t,)).fetchone()[0]:c.execute("UPDATE tasks SET status='paused' WHERE id=?",(t,));return
    c.execute('UPDATE tasks SET status=?,provider=?,attempts=? WHERE id=?',('running',p['id'],i,t))
   log(t,'activity','Agent using '+P[p['id']][0]+' / '+p['model'])
   try:
-   answer,inp,out,source=call(p,q['prompt']);context=inp+out
+   answer,inp,out,source=call(p,prompt);context=inp+out
    with db() as c:
     c.execute("INSERT INTO token_usage(provider,model,input_tokens,output_tokens,context_tokens,source,task,context_window) VALUES(?,?,?,?,?,?,?,?)",(p['id'],p['model'],inp,out,context,source,t,p['context_window']))
     c.execute("UPDATE tasks SET status='completed',output=?,error='' WHERE id=?",(answer,t))
+    if q['chat_id']:
+     c.execute("INSERT INTO chat_messages(chat_id,task_id,role,content) VALUES(?,?,?,?)",(q['chat_id'],t,'assistant',answer))
+     c.execute("UPDATE chats SET updated=CURRENT_TIMESTAMP WHERE id=?",(q['chat_id'],))
    log(t,'complete','Response saved · '+str(context)+' tokens '+('reported by provider' if source=='provider' else 'estimated'));return
   except Exception as e:log(t,'handoff',str(e)+'; trying next free provider.')
  with db() as c:c.execute("UPDATE tasks SET status='failed',error='Eligible providers failed.' WHERE id=?",(t,))
@@ -114,6 +127,17 @@ class H(BaseHTTPRequestHandler):
      limit=max(1024,int(p['context_window'] or 8192));used=int(last['context_tokens']) if last else 0
      items.append({'provider':p['id'],'model':p['model'],'context_window':limit,'input_total':totals['inp'],'output_total':totals['out'],'calls':totals['calls'],'last_input':last['input_tokens'] if last else 0,'last_output':last['output_tokens'] if last else 0,'last_context':used,'last_remaining':max(0,limit-used),'source':last['source'] if last else None,'last_call':last['created'] if last else None})
    return self.send(200,items)
+  if x=='/api/chats':
+   with db() as c:r=c.execute("SELECT h.*,(SELECT content FROM chat_messages m WHERE m.chat_id=h.id ORDER BY m.id DESC LIMIT 1) AS last_message,(SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id=h.id) AS message_count FROM chats h ORDER BY h.updated DESC").fetchall()
+   return self.send(200,[dict(z) for z in r])
+  if x.startswith('/api/chats/'):
+   parts=x.strip('/').split('/')
+   if len(parts)==4 and parts[3]=='messages':
+    cid=parts[2]
+    with db() as c:
+     if not c.execute('SELECT id FROM chats WHERE id=?',(cid,)).fetchone():return self.send(404,{'error':'Chat not found'})
+     r=c.execute('SELECT m.*,t.status AS task_status,t.error AS task_error FROM chat_messages m LEFT JOIN tasks t ON t.id=m.task_id WHERE m.chat_id=? ORDER BY m.id',(cid,)).fetchall()
+    return self.send(200,[dict(z) for z in r])
   if x=='/api/tasks':
    with db() as c:r=c.execute('SELECT * FROM tasks ORDER BY created DESC').fetchall()
    return self.send(200,[dict(z) for z in r])
@@ -136,6 +160,22 @@ class H(BaseHTTPRequestHandler):
    if k=='custom' and not (b.startswith('https://') or 'localhost' in b or '127.0.0.1' in b):return self.send(400,{'error':'Use HTTPS or a local URL.'})
    with db() as c:c.execute("UPDATE providers SET model=?,base=?,key=CASE WHEN ?='' THEN key ELSE ? END,context_window=?,enabled=1 WHERE id=?",(m,b,secret,secret,context_window,k))
    return self.send(200,{'ok':True})
+  if x=='/api/chats':
+   cid=uuid.uuid4().hex
+   title=str(d.get('title','New conversation')).strip()[:80] or 'New conversation'
+   with db() as c:c.execute('INSERT INTO chats(id,title) VALUES(?,?)',(cid,title))
+   return self.send(201,{'id':cid,'title':title})
+  if x.startswith('/api/chats/') and x.endswith('/messages'):
+   cid=x.strip('/').split('/')[2];prompt=str(d.get('prompt','')).strip()
+   if not prompt or len(prompt)>20000:return self.send(400,{'error':'Enter a message under 20,000 characters.'})
+   with db() as c:
+    if not c.execute('SELECT id FROM chats WHERE id=?',(cid,)).fetchone():return self.send(404,{'error':'Chat not found'})
+    tid=uuid.uuid4().hex
+    c.execute("INSERT INTO tasks(id,prompt,status,plan,chat_id) VALUES(?,?,'queued',?,?)",(tid,prompt,json.dumps(plan(prompt)),cid))
+    c.execute("INSERT INTO chat_messages(chat_id,task_id,role,content) VALUES(?,?,?,?)",(cid,tid,'user',prompt))
+    c.execute("UPDATE chats SET title=CASE WHEN title='New conversation' THEN ? ELSE title END,updated=CURRENT_TIMESTAMP WHERE id=?",(prompt[:64],cid))
+   log(tid,'created','Chat message saved · '+category(prompt));threading.Thread(target=run,args=(tid,),daemon=True).start()
+   return self.send(201,{'id':tid,'status':'queued'})
   if x=='/api/tasks':
    s=str(d.get('prompt','')).strip()
    if not s or len(s)>20000:return self.send(400,{'error':'Enter a task under 20,000 characters.'})
