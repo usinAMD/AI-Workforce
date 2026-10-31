@@ -1,6 +1,6 @@
 # AI Workforce
 
-Local-first AI task dashboard for Windows. Includes SQLite task history, stored plans, a free-first provider registry, model calls, failover to up to three enabled free providers, checkpoints, pause and retry controls, and a live activity feed. It also includes a per-model token meter with context-window headroom and cumulative usage, plus a responsive spatial-glass dashboard with frosted panels and soft depth.
+Local-first AI workspace for Windows. Includes a persistent chat interface with conversation history and context-aware follow-ups, task history, a free-first provider registry, model calls, failover to up to three enabled free providers, checkpoints, pause and retry controls, and a live activity feed. It also includes a per-model token meter with context-window headroom and cumulative usage, plus a responsive spatial-glass dashboard with frosted panels and soft depth.
 
 ## Start on Windows
 1. Install Python 3.10+ from https://www.python.org/downloads/windows/ and select Add Python to PATH.
