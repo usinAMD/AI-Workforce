@@ -85,7 +85,7 @@ def run(t):
  with db() as c:
   q=c.execute('SELECT * FROM tasks WHERE id=?',(t,)).fetchone()
   if not q:return
-  ps=(c.execute('SELECT * FROM providers WHERE id=? AND enabled=1',(q['preferred_provider'],)).fetchall() if q['preferred_provider'] else c.execute('SELECT * FROM providers WHERE enabled=1 AND paid=0 ORDER BY priority').fetchall())
+  ps=(c.execute('SELECT * FROM providers WHERE id=? AND enabled=1',(q['preferred_provider'],)).fetchall() if q['preferred_provider'] else c.execute("SELECT * FROM providers WHERE enabled=1 AND paid=0 AND (id!='openrouter' OR model='openrouter/free' OR model LIKE '%:free') ORDER BY priority").fetchall())
  if not ps:
   with db() as c:c.execute("UPDATE tasks SET status='waiting',error='Connect a free provider.' WHERE id=?",(t,))
   log(t,'notice','Task saved. Connect a free model to run it.');return
@@ -181,7 +181,7 @@ class H(BaseHTTPRequestHandler):
   if x.startswith('/api/chats/') and x.endswith('/messages'):
    cid=x.strip('/').split('/')[2];prompt=str(d.get('prompt','')).strip();preferred=d.get('provider') or None
    if preferred is not None and preferred not in P:return self.send(400,{'error':'Unknown model provider.'})
-   if not prompt or len(prompt)>20000:return self.send(400,{'error':'Enter a message under 20,000 characters.'})
+   if not prompt or len(prompt)>200000:return self.send(400,{'error':'Enter a message under 200,000 characters.'})
    with db() as c:
     if not c.execute('SELECT id FROM chats WHERE id=?',(cid,)).fetchone():return self.send(404,{'error':'Chat not found'})
     if preferred and not c.execute('SELECT id FROM providers WHERE id=? AND enabled=1',(preferred,)).fetchone():return self.send(409,{'error':'Connect this provider before selecting it.'})
