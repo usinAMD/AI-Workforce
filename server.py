@@ -26,17 +26,20 @@ def init():
  with db() as c:
   c.executescript("""PRAGMA journal_mode=WAL;
   CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,model TEXT,base TEXT,key TEXT,enabled INT DEFAULT 0,paid INT DEFAULT 0,priority INT DEFAULT 10,context_window INT DEFAULT 8192);
-  CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,prompt TEXT,status TEXT,plan TEXT,output TEXT DEFAULT '',provider TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP,error TEXT DEFAULT '',attempts INT DEFAULT 0,paused INT DEFAULT 0,chat_id TEXT);
+  CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,prompt TEXT,status TEXT,plan TEXT,output TEXT DEFAULT '',provider TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP,error TEXT DEFAULT '',attempts INT DEFAULT 0,paused INT DEFAULT 0,chat_id TEXT,preferred_provider TEXT);
   CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,task TEXT,kind TEXT,message TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
   CREATE TABLE IF NOT EXISTS token_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,provider TEXT,model TEXT,input_tokens INT,output_tokens INT,context_tokens INT,source TEXT,task TEXT,context_window INT,created TEXT DEFAULT CURRENT_TIMESTAMP);
-  CREATE TABLE IF NOT EXISTS chats(id TEXT PRIMARY KEY,title TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP,updated TEXT DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS chats(id TEXT PRIMARY KEY,title TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP,updated TEXT DEFAULT CURRENT_TIMESTAMP,preferred_provider TEXT);
   CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id TEXT NOT NULL,task_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
   INSERT OR IGNORE INTO settings VALUES('stop','false');
   UPDATE settings SET value='false' WHERE key='stop';
   UPDATE tasks SET status='failed',error='Interrupted by server restart; retry this task to resume.' WHERE status='running';""")
   task_cols={r[1] for r in c.execute("PRAGMA table_info(tasks)")}
   if 'chat_id' not in task_cols:c.execute("ALTER TABLE tasks ADD COLUMN chat_id TEXT")
+  if 'preferred_provider' not in task_cols:c.execute("ALTER TABLE tasks ADD COLUMN preferred_provider TEXT")
+  chat_cols={r[1] for r in c.execute("PRAGMA table_info(chats)")}
+  if 'preferred_provider' not in chat_cols:c.execute("ALTER TABLE chats ADD COLUMN preferred_provider TEXT")
   provider_cols={r[1] for r in c.execute("PRAGMA table_info(providers)")}
   if 'context_window' not in provider_cols:c.execute("ALTER TABLE providers ADD COLUMN context_window INT DEFAULT 8192")
   for k,(n,b,m,p) in P.items():c.execute('INSERT OR IGNORE INTO providers(id,model,base,paid) VALUES(?,?,?,?)',(k,m,b,int(p)))
@@ -79,8 +82,10 @@ def call(p,s):
 def chat_prompt(messages):
  return "\n\n".join(("User" if m['role']=='user' else "Assistant")+": "+m['content'] for m in messages)
 def run(t):
- with db() as c:q=c.execute('SELECT * FROM tasks WHERE id=?',(t,)).fetchone();ps=c.execute('SELECT * FROM providers WHERE enabled=1 AND paid=0 ORDER BY priority').fetchall()
- if not q:return
+ with db() as c:
+  q=c.execute('SELECT * FROM tasks WHERE id=?',(t,)).fetchone()
+  if not q:return
+  ps=(c.execute('SELECT * FROM providers WHERE id=? AND enabled=1',(q['preferred_provider'],)).fetchall() if q['preferred_provider'] else c.execute('SELECT * FROM providers WHERE enabled=1 AND paid=0 ORDER BY priority').fetchall())
  if not ps:
   with db() as c:c.execute("UPDATE tasks SET status='waiting',error='Connect a free provider.' WHERE id=?",(t,))
   log(t,'notice','Task saved. Connect a free model to run it.');return
@@ -165,13 +170,23 @@ class H(BaseHTTPRequestHandler):
    title=str(d.get('title','New conversation')).strip()[:80] or 'New conversation'
    with db() as c:c.execute('INSERT INTO chats(id,title) VALUES(?,?)',(cid,title))
    return self.send(201,{'id':cid,'title':title})
+  if x.startswith('/api/chats/') and x.endswith('/model'):
+   cid=x.strip('/').split('/')[2];preferred=d.get('provider') or None
+   if preferred is not None and preferred not in P:return self.send(400,{'error':'Unknown model provider.'})
+   with db() as c:
+    if not c.execute('SELECT id FROM chats WHERE id=?',(cid,)).fetchone():return self.send(404,{'error':'Chat not found'})
+    if preferred and not c.execute('SELECT id FROM providers WHERE id=? AND enabled=1',(preferred,)).fetchone():return self.send(409,{'error':'Connect this provider before selecting it.'})
+    c.execute('UPDATE chats SET preferred_provider=?,updated=CURRENT_TIMESTAMP WHERE id=?',(preferred,cid))
+   return self.send(200,{'ok':True,'provider':preferred})
   if x.startswith('/api/chats/') and x.endswith('/messages'):
-   cid=x.strip('/').split('/')[2];prompt=str(d.get('prompt','')).strip()
+   cid=x.strip('/').split('/')[2];prompt=str(d.get('prompt','')).strip();preferred=d.get('provider') or None
+   if preferred is not None and preferred not in P:return self.send(400,{'error':'Unknown model provider.'})
    if not prompt or len(prompt)>20000:return self.send(400,{'error':'Enter a message under 20,000 characters.'})
    with db() as c:
     if not c.execute('SELECT id FROM chats WHERE id=?',(cid,)).fetchone():return self.send(404,{'error':'Chat not found'})
+    if preferred and not c.execute('SELECT id FROM providers WHERE id=? AND enabled=1',(preferred,)).fetchone():return self.send(409,{'error':'Connect this provider before selecting it.'})
     tid=uuid.uuid4().hex
-    c.execute("INSERT INTO tasks(id,prompt,status,plan,chat_id) VALUES(?,?,'queued',?,?)",(tid,prompt,json.dumps(plan(prompt)),cid))
+    c.execute("INSERT INTO tasks(id,prompt,status,plan,chat_id,preferred_provider) VALUES(?,?,'queued',?,?,?)",(tid,prompt,json.dumps(plan(prompt)),cid,preferred))
     c.execute("INSERT INTO chat_messages(chat_id,task_id,role,content) VALUES(?,?,?,?)",(cid,tid,'user',prompt))
     c.execute("UPDATE chats SET title=CASE WHEN title='New conversation' THEN ? ELSE title END,updated=CURRENT_TIMESTAMP WHERE id=?",(prompt[:64],cid))
    log(tid,'created','Chat message saved · '+category(prompt));threading.Thread(target=run,args=(tid,),daemon=True).start()
